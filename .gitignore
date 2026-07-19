@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+.sn-skipera/
+debug_*.html
+debug_*.json
+debug_*.py
