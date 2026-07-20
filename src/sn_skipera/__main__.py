@@ -163,7 +163,7 @@ def _find_geckodriver():
     return None
 
 
-def browser_login(course_id, headless, delay, profile_path, debug=False):
+def browser_login(course_id, headless, delay, profile_path, gemini_key=None, debug=False):
     """Launch Firefox/Zen browser with your profile, auto-complete course items."""
     browser_bin = _find_browser()
     if not browser_bin:
@@ -198,15 +198,32 @@ def browser_login(course_id, headless, delay, profile_path, debug=False):
     click.echo("  (Okta SSO will complete silently using your saved session.)")
     click.echo("=" * 60 + "\n")
 
-    options = Options()
-    options.binary_location = browser_bin
-    options.add_argument("-profile")
-    options.add_argument(str(profile))
-    if headless:
-        options.add_argument("-headless")
+    def _launch(profile_path):
+        opts = Options()
+        opts.binary_location = browser_bin
+        opts.add_argument("-profile")
+        opts.add_argument(str(profile_path))
+        if headless:
+            opts.add_argument("-headless")
+        svc = Service(geckodriver)
+        return webdriver.Firefox(service=svc, options=opts)
 
-    service = Service(str(GECKODRIVER_PATH))
-    driver = webdriver.Firefox(service=service, options=options)
+    try:
+        driver = _launch(profile)
+    except Exception:
+        logger.warning(f"Profile at {profile} failed to start, trying temp copy...")
+        import shutil, tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="sn-skipera-"))
+        for f in ("cookies.sqlite", "places.sqlite", "key4.db", "cert9.db"):
+            src = Path(profile) / f
+            if src.exists():
+                shutil.copy2(str(src), str(tmp / f))
+        try:
+            driver = _launch(tmp)
+        except Exception as e2:
+            shutil.rmtree(tmp, ignore_errors=True)
+            logger.error(f"Browser launch failed even with temp profile: {e2}")
+            return 0, 0
 
     try:
         course_url = build_content_url(course_id)
@@ -254,7 +271,7 @@ def browser_login(course_id, headless, delay, profile_path, debug=False):
             return 0, 0
 
         # --- SEQUENTIAL ITEM COMPLETION LOOP ---
-        completed = failed = 0
+        completed = failed = skipped = 0
         max_items = 200
         seen_ids = set()
 
@@ -328,13 +345,18 @@ def browser_login(course_id, headless, delay, profile_path, debug=False):
                     href = BASE + href
                 driver.get(href)
 
-            # Only real approach: wait for video player, play through to end, wait for server
+            # Try video playback first
             ok = _wait_for_video_playback(driver)
-            mark = "" if ok else "(fail)"
+
+            if not ok and gemini_key:
+                ok = _complete_quiz_via_gemini(driver, gemini_key)
 
             if ok:
-                logger.success(f"  ✓ {mark}")
+                logger.success(f"  ✓")
                 completed += 1
+            elif child_type != "video" and not gemini_key:
+                logger.info("  → skipped (not a video, no Gemini key)")
+                skipped += 1
             else:
                 logger.warning("  ✗ failed")
                 failed += 1
@@ -344,7 +366,10 @@ def browser_login(course_id, headless, delay, profile_path, debug=False):
             driver.get(build_content_url(course_id))
             time.sleep(5)
 
-        logger.info(f"\nDone: {completed} completed, {failed} failed")
+        parts = [f"{completed} completed"]
+        if failed: parts.append(f"{failed} failed")
+        if skipped: parts.append(f"{skipped} skipped")
+        logger.info(f"\nDone: {', '.join(parts)}")
         logger.info("Closing browser...")
     finally:
         driver.quit()
@@ -628,30 +653,153 @@ def _wait_for_video_playback(driver):
     time.sleep(5)
     return True
 
+def _call_gemini(prompt, api_key, model="gemini-2.0-flash"):
+    """Call Gemini API with a prompt, return text response."""
+    import httpx as _httpx
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    try:
+        r = _httpx.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logger.debug(f"Gemini API error: {e}")
+        return None
 
+
+def _complete_quiz_via_gemini(driver, api_key):
+    """Detect quiz form, scrape questions, answer via Gemini, submit."""
+    try:
+        quiz_data = driver.execute_script("""
+            var result = {questions: []};
+            // Try various quiz container selectors
+            var containers = document.querySelectorAll(
+                '.question, [class*="quiz"], [class*="question"], .sn-quiz, ' +
+                '.assessment-question, .multiple-choice, form, [widget="assessment"]'
+            );
+            if (!containers.length) {
+                // Broader: find radio/checkbox groups
+                var fieldsets = document.querySelectorAll('fieldset');
+                containers = fieldsets.length ? fieldsets : [];
+            }
+            if (!containers.length) return null;
+
+            for (var ci = 0; ci < containers.length; ci++) {
+                var c = containers[ci];
+                var qText = (c.querySelector('.question-text, [class*="questionText"], label b, legend, h3, h4, p') || {}).textContent || '';
+                if (!qText) continue;
+                var choices = [];
+                var inputs = c.querySelectorAll('input[type=radio], input[type=checkbox], label.choice, .choice, [class*="option"]');
+                for (var ii = 0; ii < inputs.length; ii++) {
+                    var el = inputs[ii];
+                    var label = el.labels ? (el.labels[0] || {}).textContent : '';
+                    if (!label) label = el.textContent || el.value || el.getAttribute('data-value') || '';
+                    if (label) choices.push(label.trim());
+                }
+                if (choices.length) {
+                    result.questions.push({text: qText.trim(), choices: choices, container: ci});
+                }
+            }
+            return result.questions.length ? result : null;
+        """)
+        if not quiz_data:
+            return False
+
+        questions = quiz_data.get("questions", [])
+        if not questions:
+            return False
+
+        # Build prompt for Gemini
+        prompt_lines = ["Answer these ServiceNow quiz questions. For each question, respond with EXACTLY the answer text as it appears (one answer per line, no numbering or explanation)."]
+        for i, q in enumerate(questions):
+            prompt_lines.append(f"\nQ{i+1}: {q['text']}")
+            for c in q["choices"]:
+                prompt_lines.append(f"  - {c}")
+
+        answer_text = _call_gemini("\n".join(prompt_lines), api_key)
+        if not answer_text:
+            return False
+
+        answers = [a.strip() for a in answer_text.strip().split("\n") if a.strip()]
+
+        # Click the correct choices
+        return driver.execute_script("""
+            var answers = arguments[0];
+            var clicked = 0;
+            function findAndClick(text) {
+                var t = text.toLowerCase().trim();
+                // Try labels
+                var labels = document.querySelectorAll('label, .choice, [class*="option"], span.answer, .radio-label');
+                for (var i = 0; i < labels.length; i++) {
+                    if (labels[i].textContent.toLowerCase().trim() === t) {
+                        var input = labels[i].querySelector('input[type=radio], input[type=checkbox]');
+                        if (input) { input.click(); clicked++; return true; }
+                        labels[i].click(); clicked++; return true;
+                    }
+                }
+                // Try inputs by value
+                var inputs = document.querySelectorAll('input[type=radio], input[type=checkbox]');
+                for (var i = 0; i < inputs.length; i++) {
+                    var val = (inputs[i].value || '').toLowerCase().trim();
+                    if (val === t || inputs[i].getAttribute('data-value') === t) {
+                        inputs[i].click(); clicked++; return true;
+                    }
+                }
+                return false;
+            }
+            for (var a = 0; a < answers.length; a++) {
+                findAndClick(answers[a]);
+            }
+            // Try submit
+            var btns = document.querySelectorAll('button, input[type=submit], [class*="submit"], [class*="check-answer"]');
+            for (var i = 0; i < btns.length; i++) {
+                var txt = (btns[i].textContent || btns[i].value || '').toLowerCase();
+                if (txt.includes('submit') || txt.includes('check') || txt.includes('finish') || txt.includes('done')) {
+                    btns[i].click();
+                    break;
+                }
+            }
+            return clicked;
+        """, answers)
+    except Exception as e:
+        logger.debug(f"Quiz completion failed: {e}")
+        return False
 
 
 @click.command(context_settings={"max_content_width":100})
 @click.argument("course_url", metavar="COURSE_URL")
 @click.option("--set-cookies", is_flag=True)
+@click.option("--set-gemini-key", is_flag=True, help="Save Gemini API key for quiz answering")
+@click.option("--gemini-key", default=None, help="Gemini API key (or set GEMINI_API_KEY env)")
 @click.option("--discover", is_flag=True)
 @click.option("--browser", is_flag=True, help="Use browser automation")
 @click.option("--headless", is_flag=True)
 @click.option("--profile", default=None, help="Browser profile directory (default: auto-detect Firefox/Zen profile)")
 @click.option("--debug", is_flag=True, help="Save page source for debugging")
 @click.option("--delay", default=0.5)
-def main(course_url, set_cookies, discover, browser, headless, debug, delay, profile):
+def main(course_url, set_cookies, set_gemini_key, gemini_key, discover, browser, headless, debug, delay, profile):
     cfg = load_config()
+
+    if set_gemini_key:
+        key = click.prompt("Gemini API key", hide_input=True)
+        cfg["gemini_key"] = key
+        save_config(cfg)
+        click.echo("Gemini API key saved.")
+        return
+
     if set_cookies:
         cfg["cookies"] = prompt_cookies()
         save_config(cfg)
         click.echo(f"Saved to {CONFIG_FILE}")
         return
+
     cid = extract_course_id(course_url)
     if not cid:
         sys.exit(1)
 
     logger.info(f"Course ID: {cid}")
+
+    # Resolve Gemini key: CLI arg > env var > config file
+    gk = gemini_key or os.environ.get("GEMINI_API_KEY") or cfg.get("gemini_key")
 
     if browser:
         if not profile:
@@ -659,7 +807,7 @@ def main(course_url, set_cookies, discover, browser, headless, debug, delay, pro
         if not profile:
             logger.error("No browser profile found. Pass --profile or set SN_PROFILE_PATH.")
             sys.exit(1)
-        browser_login(cid, headless, delay, profile, debug)
+        browser_login(cid, headless, delay, profile, gk, debug)
         return
 
     if not cfg.get("cookies"):
