@@ -116,15 +116,12 @@ def complete_via_api(session, cid, child_id, endpoints):
 
 LOGIN_TIMEOUT = 600
 
-ZEN_BINARY = "/tmp/zen-wrapper/firefox"
+ZEN_BINARY = "/opt/zen-browser-bin/zen-bin"
 ZEN_PROFILE_PATH = Path.home() / ".zen" / "6bciciiq.Servicenow Profile"
 GECKODRIVER_PATH = Path.home() / ".local" / "bin" / "geckodriver"
 
 
 def _get_zen_binary():
-    wrapper = Path("/tmp/zen-wrapper/firefox")
-    if wrapper.exists():
-        return str(wrapper)
     if Path(ZEN_BINARY).exists():
         return ZEN_BINARY
     for c in ("zen-browser", "zen", "firefox"):
@@ -148,6 +145,13 @@ def browser_login(course_id, headless, delay, debug=False):
         logger.error(f"geckodriver not found at {GECKODRIVER_PATH}")
         logger.error("Install: wget ... && tar xzf ... && cp geckodriver ~/.local/bin/")
         return 0, 0
+
+    # Clean stale profile locks
+    for lock in (ZEN_PROFILE_PATH / "lock", ZEN_PROFILE_PATH / ".parentlock"):
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     try:
         from selenium import webdriver
@@ -174,139 +178,49 @@ def browser_login(course_id, headless, delay, debug=False):
     driver = webdriver.Firefox(service=service, options=options)
 
     try:
-        # --- COURSE PAGE ---
         course_url = build_content_url(course_id)
         logger.info(f"Loading course page: {course_url}")
         driver.get(course_url)
-        time.sleep(12)
 
-        # Check if we need to wait for login
-        if _selenium_needs_login(driver):
-            logger.info("Okta SSO redirecting... waiting for auto-login.")
-            for _ in range(120):
-                time.sleep(2)
-                if not _selenium_needs_login(driver):
-                    logger.success("Auto-login via existing Okta session!")
-                    break
-
-        # --- DEBUG: SAVE PAGE SOURCE AND STATE ---
-        if debug:
-            src = driver.page_source
-            (CONFIG_DIR / "debug_page.html").write_text(src)
-            logger.info(f"Saved page source ({len(src)} bytes)")
-
-            # Safe state dump (avoid cyclic objects)
-            state = driver.execute_script("""
-                var gck = (typeof g_ck !== 'undefined' ? g_ck : null);
-                try {
-                    var cookies = document.cookie;
-                } catch(e) { cookies = 'ERROR: ' + e.message; }
-                try {
-                    var lsLen = localStorage.length;
-                } catch(e) { lsLen = -1; }
-                try {
-                    var ssLen = sessionStorage.length;
-                } catch(e) { ssLen = -1; }
-                return {
-                    url: location.href,
-                    cookies: cookies,
-                    g_ck: gck,
-                    now_user: (typeof NOW !== 'undefined' ? NOW.user_name : null),
-                    now_session: (typeof NOW !== 'undefined' ? NOW.session_id : null),
-                    localStorageKeys: lsLen,
-                    sessionStorageKeys: ssLen,
-                    angularPresent: (typeof angular !== 'undefined'),
-                    pageTitle: document.title,
-                    bodyTextLen: (document.body && document.body.innerText ? document.body.innerText.length : 0)
-                };
-            """)
-            (CONFIG_DIR / "debug_state.json").write_text(json.dumps(state, indent=2))
-            logger.info(f"Saved state → URL: {state.get('url')}")
-            logger.info(f"  cookies: {state.get('cookies','')[:200]}")
-            logger.info(f"  g_ck: {state.get('g_ck')}")
-            logger.info(f"  user: {state.get('now_user')}")
-
-            links = driver.execute_script("""
-                var links = [];
-                document.querySelectorAll('a').forEach(function(a) {
-                    try {
-                        links.push({
-                            href: a.getAttribute('href'),
-                            text: (a.textContent || '').trim().slice(0,100)
-                        });
-                    } catch(e) {}
-                });
-                return links;
-            """)
-            (CONFIG_DIR / "debug_links.json").write_text(json.dumps(links, indent=2))
-            logger.info(f"Saved {len(links)} links")
-
-        # --- PROBE APIs FROM BROWSER (using XHR, not fetch) ---
-        probe_results = driver.execute_script("""
-            var courseId = arguments[0];
-            var endpoints = [
-                '/lxp/rest/learning-course/items?courseId=' + courseId,
-                '/lxp/rest/learning-course/structure?courseId=' + courseId,
-                '/lxp/rest/learning-course/progress?courseId=' + courseId,
-            ];
-            var results = [];
-            var done = 0;
-            var gck = (typeof g_ck !== 'undefined' ? g_ck : null);
-
-            function probe(url, extraHeaders) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('GET', url, true);
-                xhr.withCredentials = true;
-                xhr.setRequestHeader('Accept', 'application/json');
-                if (extraHeaders) {
-                    for (var k in extraHeaders) xhr.setRequestHeader(k, extraHeaders[k]);
-                }
-                xhr.onload = function() {
-                    results.push({
-                        url: url + (extraHeaders && extraHeaders['X-UserToken'] ? ' (with X-UserToken)' : ''),
-                        status: xhr.status,
-                        body: (xhr.responseText || '').slice(0, 500)
+        def _wait_items(driver, course_id, max_wait=30):
+            for _ in range(max_wait):
+                driver.execute_script("""
+                    document.querySelectorAll('[aria-expanded="false"], summary, .accordion-header:not(.active), [class*="collapsed"]').forEach(function(el) {
+                        try { el.click(); } catch(e) {}
                     });
-                    done++;
-                    if (done === endpoints.length + (gck ? 1 : 0)) window._sn_probeDone = results;
-                };
-                xhr.onerror = function() {
-                    results.push({ url: url, status: 0, body: 'NETWORK_ERROR' });
-                    done++;
-                    if (done === endpoints.length + (gck ? 1 : 0)) window._sn_probeDone = results;
-                };
-                xhr.send();
-            }
+                """)
+                time.sleep(1)
+                items = _angular_scope_items(driver, course_id)
+                if items:
+                    return items
+            return None
 
-            endpoints.forEach(function(url) { probe(url, null); });
-            if (gck) {
-                probe('/lxp/rest/learning-course/items?courseId=' + courseId,
-                      { 'X-UserToken': gck });
-            }
+        # Phase 1: Wait for course page items (up to 30s)
+        items = _wait_items(driver, course_id, 30)
+        if not items:
+            # Page might have redirected to home / SSO. Wait for auth then re-navigate.
+            logger.info("Course page not loaded — checking for SSO...")
+            for _ in range(60):
+                curl = driver.current_url
+                title = driver.title
+                if 'sign' in title.lower() or 'okta' in curl.lower():
+                    logger.info("Okta SSO in progress...")
+                try:
+                    gck = driver.execute_script("try{return typeof g_ck!=='undefined'?g_ck:null}catch(e){return null}")
+                    if gck and 'learning-course' in curl:
+                        logger.success("SSO complete!")
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+            logger.info("Re-navigating to course page...")
+            driver.get(course_url)
+            items = _wait_items(driver, course_id, 30)
 
-            return null; // async, we'll poll for _sn_probeDone
-        """, course_id)
-
-        # Poll for probe results (up to 15s)
-        for _ in range(30):
-            time.sleep(0.5)
-            probe_results = driver.execute_script("return window._sn_probeDone || null;")
-            if probe_results:
-                break
-
-        if probe_results:
-            logger.info("--- API Probe Results (from browser XHR) ---")
-            for r in probe_results:
-                status_str = str(r['status'])
-                logger.info(f"  {status_str} {r['url']}")
-                if r['status'] != 200:
-                    snippet = (r.get('body') or '')[:300]
-                    logger.info(f"    body: {snippet}")
-            logger.info("------------------------------------------")
-            if debug:
-                (CONFIG_DIR / "debug_probe.json").write_text(json.dumps(probe_results, indent=2))
-        else:
-            logger.warning("API probe timed out")
+        if not items:
+            logger.error("Could not load course page. Try re-authenticating in the browser.")
+            driver.quit()
+            return 0, 0
 
         # --- SEQUENTIAL ITEM COMPLETION LOOP ---
         completed = failed = 0
@@ -336,10 +250,6 @@ def browser_login(course_id, headless, delay, debug=False):
             if not items:
                 logger.warning("No items found at all.")
                 break
-
-            if debug:
-                for it in items[:5]:
-                    logger.debug(f"  {it['id'][:8]}... {it.get('title','?')[:40]} state={it.get('state','?')} allowNav={it.get('allowNavigation')} type={it.get('childType','?')}")
 
             target = None
             for it in items:
@@ -386,33 +296,10 @@ def browser_login(course_id, headless, delay, debug=False):
                 elif not href.startswith("http"):
                     href = BASE + href
                 driver.get(href)
-                time.sleep(2)
 
-            ok = False
-            mark = ""
-
-            # Try button click first (fast, works for most items)
-            ok = _click_complete_button(driver)
-            if ok:
-                mark = "(btn)"
-            elif child_type == "video":
-                ok = _complete_via_video(driver)
-                if ok:
-                    mark = ""
-
-            if not ok:
-                time.sleep(3)
-                ok = driver.execute_script("""
-                    return document.querySelectorAll('[class*="completed" i], .sn-check-mark, .is-complete').length > 0;
-                """)
-                if ok:
-                    mark = "(wait)"
-
-            # Last resort: XHR API fallback (might process server-side despite HTML response)
-            if not ok:
-                ok = _complete_item_via_xhr(driver, course_id, child_id)
-                if ok:
-                    mark = "(api)"
+            # Only real approach: wait for video player, play through to end, wait for server
+            ok = _wait_for_video_playback(driver)
+            mark = "" if ok else "(fail)"
 
             if ok:
                 logger.success(f"  ✓ {mark}")
@@ -422,32 +309,9 @@ def browser_login(course_id, headless, delay, debug=False):
                 failed += 1
 
             time.sleep(delay)
-            course_url = build_content_url(course_id)
-            driver.get(course_url)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            driver.execute_script("window.scrollTo(0, 0);")
-            # Wait for SPA to fully reload course items
-            time.sleep(3)
-            for _ in range(10):
-                scope_check = driver.execute_script("""
-                    var els = document.querySelectorAll('[data], [widget], [sn-atf-area]');
-                    for (var wi = 0; wi < els.length; wi++) {
-                        try {
-                            var s = angular.element(els[wi]).scope();
-                            if (!s) continue;
-                            var p = s;
-                            while (p) {
-                                if (p.c && p.c.data && p.c.data.items) return true;
-                                if (p['$parent'] === p) break;
-                                p = p['$parent'];
-                            }
-                        } catch(e) {}
-                    }
-                    return false;
-                """)
-                if scope_check:
-                    break
-                time.sleep(1)
+            # Refresh course page to get updated item states
+            driver.get(build_content_url(course_id))
+            time.sleep(5)
 
         logger.info(f"\nDone: {completed} completed, {failed} failed")
         logger.info("Closing browser...")
@@ -471,140 +335,10 @@ def _selenium_needs_login(driver):
     return True
 
 
-def _fetch_course_items(driver, course_id, debug=False):
-    """Fetch course items via XHR from within the browser (has session auth)."""
-    script = """
-        var courseId = arguments[0];
-        var urls = [
-            '/lxp/rest/learning-course/items?courseId=' + courseId,
-            '/lxp/rest/learning-course/structure?courseId=' + courseId,
-        ];
-        var items = [];
-        var done = 0;
-        var gck = (typeof g_ck !== 'undefined' ? g_ck : null);
 
-        function tryXHR(url, extraHeaders) {
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', url, true);
-            xhr.withCredentials = true;
-            xhr.setRequestHeader('Accept', 'application/json');
-            if (extraHeaders) {
-                for (var k in extraHeaders) xhr.setRequestHeader(k, extraHeaders[k]);
-            }
-            xhr.onload = function() {
-                if (xhr.status === 200) {
-                    try {
-                        var data = JSON.parse(xhr.responseText);
-                        var list = data.items || data.result || data.data || data.elements || data.records || data;
-                        if (Array.isArray(list)) {
-                            list.forEach(function(x) {
-                                if (typeof x === 'string') {
-                                    items.push({ id: x, title: x });
-                                } else {
-                                    var id = x.id || x.childId || x.sys_id || x.content_id || '';
-                                    var title = x.title || x.name || x.short_description || id;
-                                    if (id) items.push({ id: id, title: title });
-                                }
-                            });
-                        }
-                    } catch(e) {}
-                }
-                done++;
-                if (done === urls.length + (gck ? 1 : 0)) window._sn_fetchItemsDone = items;
-            };
-            xhr.onerror = function() {
-                done++;
-                if (done === urls.length + (gck ? 1 : 0)) window._sn_fetchItemsDone = items;
-            };
-            xhr.send();
-        }
-
-        urls.forEach(function(url) { tryXHR(url, null); });
-        if (gck) {
-            tryXHR('/lxp/rest/learning-course/items?courseId=' + courseId,
-                   { 'X-UserToken': gck });
-        }
-        return null; // async
-    """
-    try:
-        driver.execute_script(script, course_id)
-        found = None
-        for _ in range(30):
-            time.sleep(0.5)
-            found = driver.execute_script("return window._sn_fetchItemsDone || null;")
-            if found is not None:
-                break
-        if found and len(found) > 0:
-            for item in found:
-                item["href"] = f"/lxp/en/pages/learning-course?id=learning_course&course_id={course_id}&child_id={item['id']}&spa=1"
-            return found
-    except Exception as e:
-        logger.debug(f"Fetch course items failed: {e}")
-
-    return []
-
-
-def _complete_item_via_xhr(driver, course_id, child_id):
-    """Mark course item as complete via XHR API from within the browser."""
-    script = """
-        var courseId = arguments[0];
-        var childId = arguments[1];
-        var gck = (typeof g_ck !== 'undefined' ? g_ck : null);
-        var q = '?courseId=' + courseId + '&childId=' + childId;
-        var urls = [
-            '/lxp/rest/learning-course/complete-item' + q,
-            '/lxp/rest/learning-course/update-progress' + q,
-            '/lxp/rest/scorm/complete' + q,
-            '/lxp/rest/progress/update' + q,
-            '/api/now/learning/complete' + q,
-        ];
-        var payload = JSON.stringify({
-            courseId: courseId,
-            childId: childId,
-            status: 'completed',
-            progress: 100,
-            score: 100
-        });
-        var done = 0;
-        var success = false;
-
-        function tryUrl(url) {
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', url, true);
-            xhr.withCredentials = true;
-            xhr.setRequestHeader('Content-Type', 'application/json');
-            xhr.setRequestHeader('Accept', 'application/json');
-            if (gck) xhr.setRequestHeader('X-UserToken', gck);
-            xhr.onload = function() {
-                if (xhr.status >= 200 && xhr.status < 300) success = true;
-                done++;
-                if (done === urls.length) window._sn_completeDone = success;
-            };
-            xhr.onerror = function() {
-                done++;
-                if (done === urls.length) window._sn_completeDone = success;
-            };
-            xhr.send(payload);
-        }
-
-        urls.forEach(function(u) { tryUrl(u); });
-        return null;
-    """
-    try:
-        driver.execute_script(script, course_id, child_id)
-        for _ in range(10):
-            time.sleep(0.3)
-            result = driver.execute_script("return window._sn_completeDone;")
-            if result is not None:
-                return bool(result)
-    except Exception as e:
-        logger.debug(f"Complete via XHR failed: {e}")
-    return False
 
 
 def _selenium_find_items(driver):
-    time.sleep(5)
-
     script = """
         var items = [];
         var links = document.querySelectorAll('a');
@@ -743,7 +477,8 @@ def _angular_scope_items(driver, course_id):
         found = driver.execute_script(script, course_id)
         if found and len(found) > 0:
             for item in found:
-                item["href"] = f"/lxp/en/pages/learning-course?id=learning_course&course_id={course_id}&child_id={item['id']}&spa=1"
+                if not item.get("href"):
+                    item["href"] = f"/lxp/en/pages/learning-course?id=learning_course&course_id={course_id}&child_id={item['id']}&spa=1"
             return found
     except Exception as e:
         logger.debug(f"Angular scope search failed: {e}")
@@ -791,128 +526,79 @@ def _angular_scope_items(driver, course_id):
     return []
 
 
-def _click_complete_button(driver):
-    """Look for and click 'Mark Complete', 'Done', 'Finish', 'Next', 'Continue' buttons."""
-    try:
-        ok = driver.execute_script("""
-            var labels = ['mark complete', 'done', 'finish', 'next', 'continue', 'complete', 'submit'];
-            var buttons = document.querySelectorAll('button, a, input[type=button], input[type=submit], [role=button]');
-            for (var b = 0; b < buttons.length; b++) {
-                var el = buttons[b];
-                var txt = (el.textContent || el.value || '').toLowerCase().trim();
-                for (var l = 0; l < labels.length; l++) {
-                    if (txt === labels[l] || txt.indexOf(labels[l]) === 0) {
-                        el.click();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        """)
-        return bool(ok)
-    except Exception as e:
-        logger.debug(f"Click button failed: {e}")
-    return False
-
-
-def _has_video_element(driver):
-    """Quick check if a <video> element exists on the page (0 wait)."""
-    return bool(driver.execute_script("return !!document.querySelector('video');"))
-
-
-def _wait_video_ready(driver, timeout=10):
-    for _ in range(timeout * 2):
-        ok = driver.execute_script("""
-            var v = document.querySelector('video');
-            if (!v) return false;
-            if (v.readyState >= 1 && v.duration && v.duration > 0 && v.duration !== Infinity) return true;
-            return false;
-        """)
-        if ok:
-            return True
-        time.sleep(0.5)
-    return False
-
-
-def _complete_via_video(driver):
-    # Quick check: if no <video> element exists, skip immediately
-    if not _has_video_element(driver):
-        return False
-    if not _wait_video_ready(driver):
-        return False
-
-    try:
-        result = driver.execute_script("""
-            var v = document.querySelector('video');
-            if (!v) return 'NO_VIDEO';
-            var dur = v.duration;
-            if (!dur || dur === Infinity || dur === 0) return 'NO_DURATION';
-            v.currentTime = Math.max(0, dur - 5);
-            var btns = document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {
-                if (btns[i].textContent.toLowerCase().includes('play video')) {
-                    btns[i].click();
-                    break;
-                }
-            }
-            v.play();
-            setTimeout(function() {
-                window._sn_videoDone = v.ended || v.currentTime >= dur - 1;
-            }, 8000);
-            return 'PLAYING';
-        """)
-        if result in ('NO_VIDEO', 'NO_DURATION'):
-            return False
-        for _ in range(20):
-            time.sleep(0.5)
-            done = driver.execute_script("return typeof window._sn_videoDone !== 'undefined' ? window._sn_videoDone : null;")
-            if done is True:
-                return True
-            if done is False:
-                return False
-    except Exception as e:
-        logger.debug(f"Video completion failed: {e}")
-    return False
-
-
-def _scorm_complete_js():
-    return """(() => {
-        for (let el of document.querySelectorAll('[class*="completed" i], [class*="passed" i]')) {
-            if (el.offsetParent !== null) return 'SKIPPED';
-        }
-        function findAPI() {
-            if (window.API) return window.API;
-            if (window.API_1484_11) return window.API_1484_11;
-            for (let f of document.querySelectorAll('iframe')) {
+def _wait_for_video_playback(driver):
+    """Wait for video player to load, play last 15s, wait for end + 5s server buffer."""
+    # Phase 1: wait for <video-js> + <video> element (up to 20s)
+    found = False
+    for _ in range(40):
+        raw = driver.execute_script("""
+            var vjs = document.querySelector('video-js');
+            var vid = document.querySelector('video');
+            if (!vid && vjs) vid = vjs.querySelector('video');
+            if (vid) return '' + vid.readyState + '|' + vid.duration;
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
                 try {
-                    let w = f.contentWindow;
-                    if (w && (w.API || w.API_1484_11)) return w.API || w.API_1484_11;
+                    var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+                    vid = doc.querySelector('video');
+                    if (vid) return '' + vid.readyState + '|' + vid.duration;
                 } catch(e) {}
             }
             return null;
-        }
-        let api = findAPI();
-        if (!api) return 'NO_API';
-        let is2004 = !!window.API_1484_11;
-        if (typeof api.LMSInitialize === 'function') api.LMSInitialize('');
-        else if (typeof api.Initialize === 'function') api.Initialize('');
-        if (is2004) {
-            api.SetValue('cmi.completion_status', 'completed');
-            api.SetValue('cmi.success_status', 'passed');
-            api.SetValue('cmi.score.raw', '100');
-            api.SetValue('cmi.score.max', '100');
-            api.SetValue('cmi.score.min', '0');
-        } else {
-            api.LMSSetValue('cmi.core.lesson_status', 'completed');
-            api.LMSSetValue('cmi.core.score.raw', '100');
-            api.LMSSetValue('cmi.core.score.max', '100');
-        }
-        if (typeof api.Commit === 'function') api.Commit('');
-        else if (typeof api.LMSCommit === 'function') api.LMSCommit('');
-        if (typeof api.Finish === 'function') api.Finish('');
-        else if (typeof api.LMSFinish === 'function') api.LMSFinish('');
-        return 'OK';
-    })()"""
+        """)
+        if raw:
+            found = True
+            parts = raw.split("|")
+            rs = int(parts[0])
+            dur = float(parts[1]) if parts[1] != "null" and parts[1] else 0
+            if rs >= 1 and dur > 0 and dur != float("inf"):
+                break
+        time.sleep(0.5)
+    if not found:
+        return False
+
+    # Phase 2: seek near end and play
+    result = driver.execute_script("""
+        var vjs = document.querySelector('video-js');
+        var vid = document.querySelector('video');
+        if (!vid && vjs) vid = vjs.querySelector('video');
+        if (!vid) return 'NO_VIDEO';
+        var dur = vid.duration;
+        if (!dur || dur === Infinity || dur === 0) return 'NO_DUR';
+        vid.muted = true;
+        vid.currentTime = Math.max(0, dur - 15);
+        vid.play();
+        return 'OK:' + dur;
+    """)
+    if not result or not result.startswith("OK:"):
+        return False
+
+    dur = float(result.split(":")[1])
+
+    # Phase 3: poll for video to reach near end (max 30s after seek)
+    for _ in range(60):
+        time.sleep(0.5)
+        ended = driver.execute_script("""
+            var v = document.querySelector('video');
+            if (!v) {
+                var vjs = document.querySelector('video-js');
+                if (vjs) v = vjs.querySelector('video');
+            }
+            if (!v) return null;
+            return JSON.stringify({ended: v.ended, ct: v.currentTime, dur: v.duration});
+        """)
+        if ended:
+            import json as _json
+            ed = _json.loads(ended)
+            if ed["ended"] or ed["ct"] >= ed["dur"] - 1:
+                break
+
+    # Phase 4: wait 5s for server to register completion
+    time.sleep(5)
+    return True
+
+
+
 
 @click.command(context_settings={"max_content_width":100})
 @click.argument("course")
