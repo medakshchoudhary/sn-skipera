@@ -3,7 +3,7 @@
 SN-Skipera — ServiceNow video auto-complete CLI.
 sn-skipera <course_id_or_full_url>
 """
-import json, re, sys, time, subprocess
+import json, os, re, sys, time, subprocess
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -67,7 +67,8 @@ def build_content_url(course_id, group_id=None, child_id=None):
 def extract_course_id(val):
     m = re.search(r'course_id=([a-f0-9]{32})', val)
     if m: return m.group(1)
-    if re.match(r'^[a-f0-9]{32}$', val): return val
+    click.echo(f"Could not extract course_id from: {val}")
+    click.echo("Usage: sn-skipera \"https://learning.servicenow.com/lxp/en/pages/learning-course?id=learning_course&course_id=...\" --browser")
     return None
 
 def discover_endpoints(session, base_url):
@@ -116,15 +117,30 @@ def complete_via_api(session, cid, child_id, endpoints):
 
 LOGIN_TIMEOUT = 600
 
-ZEN_BINARY = "/opt/zen-browser-bin/zen-bin"
-ZEN_PROFILE_PATH = Path.home() / ".zen" / "6bciciiq.Servicenow Profile"
-GECKODRIVER_PATH = Path.home() / ".local" / "bin" / "geckodriver"
+
+def _auto_profile():
+    for p in (
+        Path.home() / ".zen" / "6bciciiq.Servicenow Profile",
+        Path.home() / ".zen",
+        Path.home() / ".mozilla" / "firefox",
+        Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles",
+        Path.home() / "sn-profile",
+    ):
+        if p.is_dir():
+            if list(p.glob("*.sqlite")) or list(p.glob("places.sqlite*")):
+                return str(p)
+            # Check for default-release or similar inside
+            subdirs = list(p.glob("*.default*")) + list(p.glob("*.default-release*"))
+            if subdirs:
+                return str(subdirs[0])
+    return None
 
 
-def _get_zen_binary():
-    if Path(ZEN_BINARY).exists():
-        return ZEN_BINARY
-    for c in ("zen-browser", "zen", "firefox"):
+def _find_browser():
+    env = os.environ.get("SN_BROWSER_BINARY")
+    if env:
+        return env
+    for c in ("firefox", "zen-browser", "zen"):
         try:
             fb = subprocess.run(["which", c], capture_output=True, text=True).stdout.strip()
             if fb:
@@ -134,20 +150,36 @@ def _get_zen_binary():
     return None
 
 
-def browser_login(course_id, headless, delay, debug=False):
-    """Launch Zen browser with your profile (has Okta session), auto-complete items."""
-    zen = _get_zen_binary()
-    if not zen:
-        logger.error("Zen/Firefox binary not found.")
+def _find_geckodriver():
+    env = os.environ.get("SN_GECKODRIVER_PATH")
+    if env:
+        return env
+    try:
+        gd = subprocess.run(["which", "geckodriver"], capture_output=True, text=True).stdout.strip()
+        if gd:
+            return gd
+    except Exception:
+        pass
+    return None
+
+
+def browser_login(course_id, headless, delay, profile_path, debug=False):
+    """Launch Firefox/Zen browser with your profile, auto-complete course items."""
+    browser_bin = _find_browser()
+    if not browser_bin:
+        logger.error("No Firefox-based browser found. Install Firefox or set SN_BROWSER_BINARY.")
         return 0, 0
 
-    if not GECKODRIVER_PATH.exists():
-        logger.error(f"geckodriver not found at {GECKODRIVER_PATH}")
-        logger.error("Install: wget ... && tar xzf ... && cp geckodriver ~/.local/bin/")
+    geckodriver = _find_geckodriver()
+    if not geckodriver:
+        logger.error("geckodriver not found. Install it or set SN_GECKODRIVER_PATH.")
+        logger.error("  Linux: wget https://github.com/mozilla/geckodriver/releases/...")
+        logger.error("  macOS: brew install geckodriver")
         return 0, 0
 
     # Clean stale profile locks
-    for lock in (ZEN_PROFILE_PATH / "lock", ZEN_PROFILE_PATH / ".parentlock"):
+    profile = Path(profile_path)
+    for lock in (profile / "lock", profile / ".parentlock"):
         try:
             lock.unlink(missing_ok=True)
         except Exception:
@@ -162,15 +194,14 @@ def browser_login(course_id, headless, delay, debug=False):
         return 0, 0
 
     click.echo("\n" + "=" * 60)
-    click.echo("  Opening Zen browser with your Servicenow profile.")
-    click.echo("  (You should already be logged in — Okta SSO will")
-    click.echo("   complete silently using your saved session.)")
+    click.echo("  Opening browser with your ServiceNow profile.")
+    click.echo("  (Okta SSO will complete silently using your saved session.)")
     click.echo("=" * 60 + "\n")
 
     options = Options()
-    options.binary_location = zen
+    options.binary_location = browser_bin
     options.add_argument("-profile")
-    options.add_argument(str(ZEN_PROFILE_PATH))
+    options.add_argument(str(profile))
     if headless:
         options.add_argument("-headless")
 
@@ -601,34 +632,39 @@ def _wait_for_video_playback(driver):
 
 
 @click.command(context_settings={"max_content_width":100})
-@click.argument("course")
+@click.argument("course_url", metavar="COURSE_URL")
 @click.option("--set-cookies", is_flag=True)
 @click.option("--discover", is_flag=True)
 @click.option("--browser", is_flag=True, help="Use browser automation")
 @click.option("--headless", is_flag=True)
+@click.option("--profile", default=None, help="Browser profile directory (default: auto-detect Firefox/Zen profile)")
 @click.option("--debug", is_flag=True, help="Save page source for debugging")
 @click.option("--delay", default=0.5)
-def main(course, set_cookies, discover, browser, headless, debug, delay):
+def main(course_url, set_cookies, discover, browser, headless, debug, delay, profile):
     cfg = load_config()
     if set_cookies:
         cfg["cookies"] = prompt_cookies()
         save_config(cfg)
         click.echo(f"Saved to {CONFIG_FILE}")
         return
-    cid = extract_course_id(course)
+    cid = extract_course_id(course_url)
     if not cid:
-        logger.error("Could not find course_id. Pass a full URL or the 32-char hex course_id.")
         sys.exit(1)
 
     logger.info(f"Course ID: {cid}")
 
     if browser:
-        browser_login(cid, headless, delay, debug)
+        if not profile:
+            profile = os.environ.get("SN_PROFILE_PATH", _auto_profile())
+        if not profile:
+            logger.error("No browser profile found. Pass --profile or set SN_PROFILE_PATH.")
+            sys.exit(1)
+        browser_login(cid, headless, delay, profile, debug)
         return
 
     if not cfg.get("cookies"):
-        click.echo("No cookies found. For non-browser mode, run: sn-skipera --set-cookies")
-        click.echo("Or use --browser for browser-based auto-completion.")
+        click.echo("No cookies found. Run with --browser for browser-based auto-completion.")
+        click.echo("Usage: sn-skipera \"FULL_COURSE_URL\" --browser")
         return
 
     course_url = build_content_url(cid)

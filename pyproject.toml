@@ -1,7 +1,20 @@
 [project]
 name = "sn-skipera"
 version = "1.0.0"
-description = "CLI tool to auto-complete ServiceNow NowLearning videos"
+description = "Auto-complete ServiceNow NowLearning course videos via browser automation"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = []
+keywords = ["servicenow", "nowlearning", "learning", "automation", "video"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.25.0",
@@ -9,6 +22,10 @@ dependencies = [
     "loguru>=0.7.0",
     "selenium>=4.15.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/daksh2k4/sn-skipera"
+Source = "https://github.com/daksh2k4/sn-skipera"
 
 [project.scripts]
 sn-skipera = "sn_skipera.__main__:main"
