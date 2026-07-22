@@ -1,6 +1,6 @@
 [project]
 name = "sn-skipera"
-version = "1.0.1"
+version = "1.0.2"
 description = "Auto-complete ServiceNow NowLearning course videos via browser automation"
 readme = "README.md"
 license = {file = "LICENSE"}
