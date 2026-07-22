@@ -3,7 +3,7 @@
 SN-Skipera — ServiceNow video auto-complete CLI.
 sn-skipera <course_id_or_full_url>
 """
-import json, os, re, sys, time, subprocess
+import json, os, re, sys, time, subprocess, shutil, tempfile
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -177,14 +177,6 @@ def browser_login(course_id, headless, delay, profile_path, gemini_key=None, deb
         logger.error("  macOS: brew install geckodriver")
         return 0, 0
 
-    # Clean stale profile locks
-    profile = Path(profile_path)
-    for lock in (profile / "lock", profile / ".parentlock"):
-        try:
-            lock.unlink(missing_ok=True)
-        except Exception:
-            pass
-
     try:
         from selenium import webdriver
         from selenium.webdriver.firefox.options import Options
@@ -198,6 +190,27 @@ def browser_login(course_id, headless, delay, profile_path, gemini_key=None, deb
     click.echo("  (Okta SSO will complete silently using your saved session.)")
     click.echo("=" * 60 + "\n")
 
+    # Copy user profile to temp directory so geckodriver never touches the original.
+    # See LEARNINGS.md: geckodriver modifies compatibility.ini and other metadata,
+    # which corrupts the profile for normal browsing.
+    src_profile = Path(profile_path)
+    if not src_profile.is_dir():
+        logger.error(f"Profile directory not found: {src_profile}")
+        return 0, 0
+    tmp_profile = Path(tempfile.mkdtemp(prefix="sn-skipera-"))
+    for item in src_profile.iterdir():
+        try:
+            dst = tmp_profile / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, symlinks=True, ignore_dangling_symlinks=True)
+            else:
+                shutil.copy2(item, dst)
+        except Exception:
+            pass
+    # Clean stale lock files from the copy
+    for lock in (tmp_profile / "lock", tmp_profile / ".parentlock"):
+        lock.unlink(missing_ok=True)
+
     def _launch(profile_path):
         opts = Options()
         opts.binary_location = browser_bin
@@ -209,21 +222,11 @@ def browser_login(course_id, headless, delay, profile_path, gemini_key=None, deb
         return webdriver.Firefox(service=svc, options=opts)
 
     try:
-        driver = _launch(profile)
-    except Exception:
-        logger.warning(f"Profile at {profile} failed to start, trying temp copy...")
-        import shutil, tempfile
-        tmp = Path(tempfile.mkdtemp(prefix="sn-skipera-"))
-        for f in ("cookies.sqlite", "places.sqlite", "key4.db", "cert9.db"):
-            src = Path(profile) / f
-            if src.exists():
-                shutil.copy2(str(src), str(tmp / f))
-        try:
-            driver = _launch(tmp)
-        except Exception as e2:
-            shutil.rmtree(tmp, ignore_errors=True)
-            logger.error(f"Browser launch failed even with temp profile: {e2}")
-            return 0, 0
+        driver = _launch(tmp_profile)
+    except Exception as e:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+        logger.error(f"Browser launch failed: {e}")
+        return 0, 0
 
     try:
         course_url = build_content_url(course_id)
@@ -373,6 +376,10 @@ def browser_login(course_id, headless, delay, profile_path, gemini_key=None, deb
         logger.info("Closing browser...")
     finally:
         driver.quit()
+        try:
+            shutil.rmtree(tmp_profile, ignore_errors=True)
+        except Exception:
+            pass
     return completed, failed
 
 

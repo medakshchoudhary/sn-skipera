@@ -70,7 +70,19 @@ The `g_ck` token (X-UserToken for API calls) is set after page load in a script:
 - Profile-based login preserves Okta SSO session cookies.
 - Stale lock files (`lock`, `.parentlock`) must be cleaned before launch.
 - WAL files (`.sqlite-wal`) can cause `NS_ERROR_STORAGE_BUSY` errors.
-- Fallback: copy `cookies.sqlite`, `places.sqlite`, `key4.db`, `cert9.db` to a temp profile.
+
+### Profile Safety
+
+**Critical:** geckodriver modifies a profile's `compatibility.ini`, `prefs.js`, cache, and other metadata when it opens a profile. This causes Firefox/Zen to reject the profile with the error "You've launched an older version of Zen Browser."
+
+**Architecture:** sn-skipera **always copies** the user's profile to a temp directory (`tempfile.mkdtemp`) and launches the browser from the copy. The original profile is never touched by geckodriver.
+
+- Full recursive copy with `shutil.copytree(symlinks=True, ignore_dangling_symlinks=True)`.
+- Stale lock files are cleaned from the copy only.
+- Temp directory is deleted in `finally` via `shutil.rmtree`.
+- If the copy fails, the error is silently skipped per-file — partial copies are sufficient for login.
+
+Do **not** revert to launching the original profile directly. If launch fails, log the error and exit — do not fall back to the original.
 
 ## Quiz Detection
 
