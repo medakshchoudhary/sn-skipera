@@ -1,6 +1,6 @@
 [project]
 name = "sn-skipera"
-version = "1.0.0"
+version = "1.0.1"
 description = "Auto-complete ServiceNow NowLearning course videos via browser automation"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/daksh2k4/sn-skipera"
-Source = "https://github.com/daksh2k4/sn-skipera"
+Homepage = "https://github.com/medakshchoudhary/sn-skipera"
+Source = "https://github.com/medakshchoudhary/sn-skipera"
 
 [project.scripts]
 sn-skipera = "sn_skipera.__main__:main"
